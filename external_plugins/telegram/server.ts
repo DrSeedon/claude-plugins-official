@@ -946,6 +946,15 @@ async function handleInbound(
           reply_to_text: ctx.message.reply_to_message.text ?? '',
           reply_to_msg_id: String(ctx.message.reply_to_message.message_id),
         } : {}),
+        ...(ctx.message?.forward_origin ? {
+          forwarded_from: ctx.message.forward_origin.type === 'user'
+            ? (ctx.message.forward_origin as any).sender_user?.first_name ?? 'user'
+            : ctx.message.forward_origin.type === 'hidden_user'
+            ? (ctx.message.forward_origin as any).sender_user_name ?? 'hidden'
+            : ctx.message.forward_origin.type === 'channel'
+            ? (ctx.message.forward_origin as any).chat?.title ?? 'channel'
+            : ctx.message.forward_origin.type,
+        } : {}),
         ...(attachment ? {
           attachment_kind: attachment.kind,
           attachment_file_id: attachment.file_id,
