@@ -98,6 +98,8 @@ type Access = {
   textChunkLimit?: number
   /** Split on paragraph boundaries instead of hard char count. */
   chunkMode?: 'length' | 'newline'
+  /** Debounce delay in ms for combining rapid text messages. 0 disables. Default: 3000. */
+  debounceMs?: number
 }
 
 function defaultAccess(): Access {
@@ -746,111 +748,54 @@ bot.on('callback_query:data', async ctx => {
   }
 })
 
-bot.on('message:text', async ctx => {
-  await handleInbound(ctx, ctx.message.text, undefined)
+bot.on('message:text', ctx => {
+  handleInbound(ctx, ctx.message.text)
 })
 
-bot.on('message:photo', async ctx => {
+bot.on('message:photo', ctx => {
   const caption = ctx.message.caption ?? '(photo)'
-  // Defer download until after the gate approves — any user can send photos,
-  // and we don't want to burn API quota or fill the inbox for dropped messages.
-  await handleInbound(ctx, caption, async () => {
-    // Largest size is last in the array.
-    const photos = ctx.message.photo
-    const best = photos[photos.length - 1]
-    try {
-      const file = await ctx.api.getFile(best.file_id)
-      if (!file.file_path) return undefined
-      const url = `https://api.telegram.org/file/bot${TOKEN}/${file.file_path}`
-      const res = await fetch(url)
-      const buf = Buffer.from(await res.arrayBuffer())
-      const ext = file.file_path.split('.').pop() ?? 'jpg'
-      const path = join(INBOX_DIR, `${Date.now()}-${best.file_unique_id}.${ext}`)
-      mkdirSync(INBOX_DIR, { recursive: true })
-      writeFileSync(path, buf)
-      return path
-    } catch (err) {
-      process.stderr.write(`telegram channel: photo download failed: ${err}\n`)
-      return undefined
-    }
+  const photos = ctx.message.photo
+  const best = photos[photos.length - 1]
+  handleInbound(ctx, caption, {
+    kind: 'photo',
+    file_id: best.file_id,
+    file_unique_id: best.file_unique_id,
   })
 })
 
-bot.on('message:document', async ctx => {
+bot.on('message:document', ctx => {
   const doc = ctx.message.document
   const name = safeName(doc.file_name)
   const text = ctx.message.caption ?? `(document: ${name ?? 'file'})`
-  await handleInbound(ctx, text, undefined, {
-    kind: 'document',
-    file_id: doc.file_id,
-    size: doc.file_size,
-    mime: doc.mime_type,
-    name,
-  })
+  handleInbound(ctx, text, { kind: 'document', file_id: doc.file_id, size: doc.file_size, mime: doc.mime_type, name })
 })
 
-bot.on('message:voice', async ctx => {
+bot.on('message:voice', ctx => {
   const voice = ctx.message.voice
-  const text = ctx.message.caption ?? '(voice message)'
-  await handleInbound(ctx, text, undefined, {
-    kind: 'voice',
-    file_id: voice.file_id,
-    size: voice.file_size,
-    mime: voice.mime_type,
-  })
+  handleInbound(ctx, ctx.message.caption ?? '(voice message)', { kind: 'voice', file_id: voice.file_id, file_unique_id: voice.file_unique_id, size: voice.file_size, mime: voice.mime_type })
 })
 
-bot.on('message:audio', async ctx => {
+bot.on('message:audio', ctx => {
   const audio = ctx.message.audio
   const name = safeName(audio.file_name)
-  const text = ctx.message.caption ?? `(audio: ${safeName(audio.title) ?? name ?? 'audio'})`
-  await handleInbound(ctx, text, undefined, {
-    kind: 'audio',
-    file_id: audio.file_id,
-    size: audio.file_size,
-    mime: audio.mime_type,
-    name,
-  })
+  handleInbound(ctx, ctx.message.caption ?? `(audio: ${safeName(audio.title) ?? name ?? 'audio'})`, { kind: 'audio', file_id: audio.file_id, size: audio.file_size, mime: audio.mime_type, name })
 })
 
-bot.on('message:video', async ctx => {
+bot.on('message:video', ctx => {
   const video = ctx.message.video
-  const text = ctx.message.caption ?? '(video)'
-  await handleInbound(ctx, text, undefined, {
-    kind: 'video',
-    file_id: video.file_id,
-    size: video.file_size,
-    mime: video.mime_type,
-    name: safeName(video.file_name),
-  })
+  handleInbound(ctx, ctx.message.caption ?? '(video)', { kind: 'video', file_id: video.file_id, size: video.file_size, mime: video.mime_type, name: safeName(video.file_name) })
 })
 
-bot.on('message:video_note', async ctx => {
+bot.on('message:video_note', ctx => {
   const vn = ctx.message.video_note
-  await handleInbound(ctx, '(video note)', undefined, {
-    kind: 'video_note',
-    file_id: vn.file_id,
-    size: vn.file_size,
-  })
+  handleInbound(ctx, '(video note)', { kind: 'video_note', file_id: vn.file_id, size: vn.file_size })
 })
 
-bot.on('message:sticker', async ctx => {
+bot.on('message:sticker', ctx => {
   const sticker = ctx.message.sticker
   const emoji = sticker.emoji ? ` ${sticker.emoji}` : ''
-  await handleInbound(ctx, `(sticker${emoji})`, undefined, {
-    kind: 'sticker',
-    file_id: sticker.file_id,
-    size: sticker.file_size,
-  })
+  handleInbound(ctx, `(sticker${emoji})`, { kind: 'sticker', file_id: sticker.file_id, file_unique_id: sticker.file_unique_id, size: sticker.file_size })
 })
-
-type AttachmentMeta = {
-  kind: string
-  file_id: string
-  size?: number
-  mime?: string
-  name?: string
-}
 
 // Filenames and titles are uploader-controlled. They land inside the <channel>
 // notification — delimiter chars would let the uploader break out of the tag
@@ -859,33 +804,221 @@ function safeName(s: string | undefined): string | undefined {
   return s?.replace(/[<>\[\]\r\n;]/g, '_')
 }
 
-async function handleInbound(
+// ---------------------------------------------------------------------------
+// Debounce: buffer ALL incoming messages (text + media) per chat, flush after
+// a quiet period.  Nothing async happens in the handler — photos, voice, and
+// documents are stored as raw file_id references and only downloaded when the
+// batch flushes.  This guarantees that Grammy's concurrent handler dispatch
+// cannot break message ordering or cause partial batches.
+//
+// On flush: the entire batch is emitted as a single MCP notification.
+// Text messages are merged with newline joins.  Photos, voice, and small
+// files (<5MB) are downloaded and inlined as [image:], [voice:], [file:].
+// Large files stay as [attachment: file_id=...] for on-demand download.
+// ---------------------------------------------------------------------------
+
+type MediaRef = {
+  kind: string
+  file_id: string
+  file_unique_id?: string
+  size?: number
+  mime?: string
+  name?: string
+}
+
+type BufferedMessage = {
+  text: string
+  chatId: string
+  messageId: number | undefined
+  user: string
+  userId: string
+  ts: string
+  media: MediaRef | undefined
+  replyToText?: string
+  replyToMsgId?: string
+  forwardedFrom?: string
+}
+
+type PendingBatch = {
+  messages: BufferedMessage[]
+  timer: ReturnType<typeof setTimeout>
+}
+
+const pendingBatches = new Map<string, PendingBatch>()
+
+function emitNotification(content: string, meta: Record<string, string>): void {
+  mcp.notification({
+    method: 'notifications/claude/channel',
+    params: { content, meta },
+  }).catch(err => {
+    process.stderr.write(`telegram channel: failed to deliver inbound to Claude: ${err}\n`)
+  })
+}
+
+function debounceMessage(msg: BufferedMessage, delayMs: number): void {
+  const chatId = msg.chatId
+  const existing = pendingBatches.get(chatId)
+  if (existing) {
+    clearTimeout(existing.timer)
+    existing.messages.push(msg)
+    existing.timer = setTimeout(() => flushBatch(chatId), delayMs)
+  } else {
+    const timer = setTimeout(() => flushBatch(chatId), delayMs)
+    pendingBatches.set(chatId, { messages: [msg], timer })
+  }
+}
+
+// Download any small file (photos, voice messages) from Telegram at flush time.
+// Returns the local path or undefined on failure.  Large files (videos, docs)
+// are left as file_id references for on-demand download_attachment.
+async function downloadFile(fileId: string, fileUniqueId: string, defaultExt: string): Promise<string | undefined> {
+  try {
+    const file = await bot.api.getFile(fileId)
+    if (!file.file_path) return undefined
+    const url = `https://api.telegram.org/file/bot${TOKEN}/${file.file_path}`
+    const res = await fetch(url)
+    const buf = Buffer.from(await res.arrayBuffer())
+    const ext = file.file_path.split('.').pop() ?? defaultExt
+    const path = join(INBOX_DIR, `${Date.now()}-${fileUniqueId}.${ext}`)
+    mkdirSync(INBOX_DIR, { recursive: true })
+    writeFileSync(path, buf)
+    return path
+  } catch (err) {
+    process.stderr.write(`telegram channel: file download failed: ${err}\n`)
+    return undefined
+  }
+}
+
+// Photos, voice messages, and stickers are always auto-downloaded (they're
+// small).  Other media types (documents, audio, video, video notes) are
+// auto-downloaded only if their size is known and below this threshold.
+// Files above this limit stay as file_id references for on-demand download.
+const ALWAYS_DOWNLOAD_KINDS = new Set(['photo', 'voice', 'sticker'])
+const AUTO_DOWNLOAD_MAX_BYTES = 5 * 1024 * 1024 // 5 MB
+
+function buildMeta(msg: BufferedMessage, extra?: Record<string, string>): Record<string, string> {
+  return {
+    chat_id: msg.chatId,
+    ...(msg.messageId != null ? { message_id: String(msg.messageId) } : {}),
+    user: msg.user,
+    user_id: msg.userId,
+    ts: msg.ts,
+    ...(msg.replyToText != null ? { reply_to_text: msg.replyToText, reply_to_msg_id: msg.replyToMsgId! } : {}),
+    ...(msg.forwardedFrom != null ? { forwarded_from: msg.forwardedFrom } : {}),
+    ...extra,
+  }
+}
+
+async function flushBatch(chatId: string): Promise<void> {
+  const batch = pendingBatches.get(chatId)
+  if (!batch) return
+  pendingBatches.delete(chatId)
+
+  // Build a single notification from the entire batch.  Text is joined with
+  // newlines.  Photos, voice, and small files are downloaded and inlined as
+  // [image: /path], [voice: /path], [file: /path].  Large files (>5MB) are
+  // kept as [attachment: file_id=...] for on-demand download_attachment.
+  // Meta uses the first message's message_id (for reply threading) and the
+  // latest timestamp.
+  const parts: string[] = []
+  const meta = buildMeta(batch.messages[0])
+  const attachments: { kind: string; file_id: string; size?: number; mime?: string; name?: string }[] = []
+
+  for (const msg of batch.messages) {
+    meta.ts = msg.ts  // always keep latest timestamp
+
+    if (msg.media) {
+      const kind = msg.media.kind
+      const alwaysDl = ALWAYS_DOWNLOAD_KINDS.has(kind)
+      const smallEnough = msg.media.size != null && msg.media.size <= AUTO_DOWNLOAD_MAX_BYTES
+      const canDownload = !!msg.media.file_unique_id || !!msg.media.file_id
+      const autoDownload = canDownload && (alwaysDl || smallEnough)
+
+      if (autoDownload) {
+        const uid = msg.media.file_unique_id ?? msg.media.file_id
+        const defaultExt = kind === 'photo' ? 'jpg' : kind === 'voice' ? 'oga'
+          : kind === 'sticker' ? 'webp' : kind === 'audio' ? 'mp3'
+          : kind === 'video' ? 'mp4' : kind === 'video_note' ? 'mp4'
+          : msg.media.name?.split('.').pop() ?? 'bin'
+        const path = await downloadFile(msg.media.file_id, uid, defaultExt)
+        // Skip generic placeholder captions like "(photo)", "(voice message)" etc.
+        const placeholder = /^\((photo|voice message|video|video note|audio|sticker.*|document.*)\)$/i
+        if (msg.text && !placeholder.test(msg.text)) parts.push(msg.text)
+        if (path) {
+          if (kind === 'photo') {
+            parts.push(`[image: ${path}]`)
+            if (!meta.image_path) meta.image_path = path
+          } else if (kind === 'voice') {
+            parts.push(`[voice: ${path}]`)
+          } else {
+            parts.push(`[file: ${path}]`)
+          }
+        }
+      } else {
+        // Large files: keep as file_id reference for on-demand download.
+        if (msg.text) parts.push(msg.text)
+        parts.push(`[attachment: kind=${kind} file_id=${msg.media.file_id}${msg.media.mime ? ' mime=' + msg.media.mime : ''}${msg.media.name ? ' name=' + msg.media.name : ''}${msg.media.size != null ? ' size=' + msg.media.size : ''}]`)
+        attachments.push({
+          kind: msg.media.kind,
+          file_id: msg.media.file_id,
+          size: msg.media.size,
+          mime: msg.media.mime,
+          name: msg.media.name,
+        })
+      }
+    } else {
+      parts.push(msg.text)
+    }
+  }
+
+  // Add attachment metadata for the first non-photo attachment.
+  // Additional attachments are referenced in the text via file_id.
+  if (attachments.length > 0) {
+    const first = attachments[0]
+    meta.attachment_kind = first.kind
+    meta.attachment_file_id = first.file_id
+    if (first.size != null) meta.attachment_size = String(first.size)
+    if (first.mime) meta.attachment_mime = first.mime
+    if (first.name) meta.attachment_name = first.name
+  }
+
+  emitNotification(parts.join('\n'), meta)
+}
+
+function flushAll(): void {
+  for (const chatId of pendingBatches.keys()) {
+    void flushBatch(chatId)
+  }
+}
+process.on('SIGTERM', flushAll)
+process.on('SIGINT', flushAll)
+
+// ---------------------------------------------------------------------------
+// handleInbound: gate-check, ack, then buffer into debounce.  Fully
+// synchronous — no async work here, so Grammy's concurrent dispatch is fine.
+// ---------------------------------------------------------------------------
+
+function handleInbound(
   ctx: Context,
   text: string,
-  downloadImage: (() => Promise<string | undefined>) | undefined,
-  attachment?: AttachmentMeta,
-): Promise<void> {
+  media?: MediaRef,
+): void {
   const result = gate(ctx)
 
   if (result.action === 'drop') return
 
   if (result.action === 'pair') {
-    const lead = result.isResend ? 'Still pending' : 'Pairing required'
-    await ctx.reply(
-      `${lead} — run in Claude Code:\n\n/telegram:access pair ${result.code}`,
+    void ctx.reply(
+      `${result.isResend ? 'Still pending' : 'Pairing required'} — run in Claude Code:\n\n/telegram:access pair ${result.code}`,
     )
     return
   }
 
   const access = result.access
   const from = ctx.from!
-  const chat_id = String(ctx.chat!.id)
+  const chatId = String(ctx.chat!.id)
   const msgId = ctx.message?.message_id
 
-  // Permission-reply intercept: if this looks like "yes xxxxx" for a
-  // pending permission request, emit the structured event instead of
-  // relaying as chat. The sender is already gate()-approved at this point
-  // (non-allowlisted senders were dropped above), so we trust the reply.
   const permMatch = PERMISSION_REPLY_RE.exec(text)
   if (permMatch) {
     void mcp.notification({
@@ -897,67 +1030,69 @@ async function handleInbound(
     })
     if (msgId != null) {
       const emoji = permMatch[1]!.toLowerCase().startsWith('y') ? '✅' : '❌'
-      void bot.api.setMessageReaction(chat_id, msgId, [
+      void bot.api.setMessageReaction(chatId, msgId, [
         { type: 'emoji', emoji: emoji as ReactionTypeEmoji['emoji'] },
       ]).catch(() => {})
     }
     return
   }
 
-  // Typing indicator — signals "processing" until we reply (or ~5s elapses).
-  void bot.api.sendChatAction(chat_id, 'typing').catch(() => {})
-
-  // Ack reaction — lets the user know we're processing. Fire-and-forget.
-  // Telegram only accepts a fixed emoji whitelist — if the user configures
-  // something outside that set the API rejects it and we swallow.
   if (access.ackReaction && msgId != null) {
     void bot.api
-      .setMessageReaction(chat_id, msgId, [
+      .setMessageReaction(chatId, msgId, [
         { type: 'emoji', emoji: access.ackReaction as ReactionTypeEmoji['emoji'] },
       ])
       .catch(() => {})
   }
 
-  const imagePath = downloadImage ? await downloadImage() : undefined
+  if (!pendingBatches.has(chatId)) {
+    void bot.api.sendChatAction(chatId, 'typing').catch(() => {})
+  }
 
-  // image_path goes in meta only — an in-content "[image attached — read: PATH]"
-  // annotation is forgeable by any allowlisted sender typing that string.
-  mcp.notification({
-    method: 'notifications/claude/channel',
-    params: {
-      content: text,
-      meta: {
-        chat_id,
-        ...(msgId != null ? { message_id: String(msgId) } : {}),
-        user: from.username ?? String(from.id),
-        user_id: String(from.id),
-        ts: new Date((ctx.message?.date ?? 0) * 1000).toISOString(),
-        ...(imagePath ? { image_path: imagePath } : {}),
-        ...(ctx.message?.reply_to_message ? {
-          reply_to_text: ctx.message.reply_to_message.text ?? '',
-          reply_to_msg_id: String(ctx.message.reply_to_message.message_id),
-        } : {}),
-        ...(ctx.message?.forward_origin ? {
-          forwarded_from: ctx.message.forward_origin.type === 'user'
-            ? (ctx.message.forward_origin as any).sender_user?.first_name ?? 'user'
-            : ctx.message.forward_origin.type === 'hidden_user'
-            ? (ctx.message.forward_origin as any).sender_user_name ?? 'hidden'
-            : ctx.message.forward_origin.type === 'channel'
-            ? (ctx.message.forward_origin as any).chat?.title ?? 'channel'
-            : ctx.message.forward_origin.type,
-        } : {}),
-        ...(attachment ? {
-          attachment_kind: attachment.kind,
-          attachment_file_id: attachment.file_id,
-          ...(attachment.size != null ? { attachment_size: String(attachment.size) } : {}),
-          ...(attachment.mime ? { attachment_mime: attachment.mime } : {}),
-          ...(attachment.name ? { attachment_name: attachment.name } : {}),
-        } : {}),
-      },
-    },
-  }).catch(err => {
-    process.stderr.write(`telegram channel: failed to deliver inbound to Claude: ${err}\n`)
-  })
+  const debounceMs = access.debounceMs ?? 3000
+  const msg: BufferedMessage = {
+    text,
+    chatId,
+    messageId: msgId,
+    user: from.username ?? String(from.id),
+    userId: String(from.id),
+    ts: new Date((ctx.message?.date ?? 0) * 1000).toISOString(),
+    media,
+    ...(ctx.message?.reply_to_message ? {
+      replyToText: ctx.message.reply_to_message.text ?? '',
+      replyToMsgId: String(ctx.message.reply_to_message.message_id),
+    } : {}),
+    ...(ctx.message?.forward_origin ? {
+      forwardedFrom: ctx.message.forward_origin.type === 'user'
+        ? (ctx.message.forward_origin as any).sender_user?.first_name ?? 'user'
+        : ctx.message.forward_origin.type === 'hidden_user'
+        ? (ctx.message.forward_origin as any).sender_user_name ?? 'hidden'
+        : ctx.message.forward_origin.type === 'channel'
+        ? (ctx.message.forward_origin as any).chat?.title ?? 'channel'
+        : ctx.message.forward_origin.type,
+    } : {}),
+  }
+
+  if (debounceMs > 0) {
+    debounceMessage(msg, debounceMs)
+    return
+  }
+
+  // No debounce — emit immediately (async download for photos).
+  void (async () => {
+    const extra: Record<string, string> = {}
+    if (media?.kind === 'photo' && media.file_unique_id) {
+      const path = await downloadFile(media.file_id, media.file_unique_id, 'jpg')
+      if (path) extra.image_path = path
+    } else if (media) {
+      extra.attachment_kind = media.kind
+      extra.attachment_file_id = media.file_id
+      if (media.size != null) extra.attachment_size = String(media.size)
+      if (media.mime) extra.attachment_mime = media.mime
+      if (media.name) extra.attachment_name = media.name
+    }
+    emitNotification(text, buildMeta(msg, extra))
+  })()
 }
 
 // Without this, any throw in a message handler stops polling permanently
