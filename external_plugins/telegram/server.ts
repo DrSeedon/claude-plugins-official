@@ -907,13 +907,15 @@ async function handleInbound(
     return
   }
 
-  // Typing indicator — repeat every 4s until reply is sent.
+  // Typing indicator — repeat every 4s until reply is sent (max 60s safety net).
+  if (!(globalThis as any).__typingIntervals) (globalThis as any).__typingIntervals = new Map()
+  const prevTi = (globalThis as any).__typingIntervals.get(chat_id)
+  if (prevTi) clearInterval(prevTi)
   void bot.api.sendChatAction(chat_id, 'typing').catch(() => {})
   const typingInterval = setInterval(() => {
     void bot.api.sendChatAction(chat_id, 'typing').catch(() => {})
   }, 4000)
-  setTimeout(() => clearInterval(typingInterval), 300_000)
-  if (!(globalThis as any).__typingIntervals) (globalThis as any).__typingIntervals = new Map()
+  setTimeout(() => { clearInterval(typingInterval); (globalThis as any).__typingIntervals.delete(chat_id) }, 60_000)
   ;(globalThis as any).__typingIntervals.set(chat_id, typingInterval)
 
   // Ack reaction — lets the user know we're processing. Fire-and-forget.
