@@ -494,9 +494,6 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
       case 'reply': {
         const chat_id = args.chat_id as string
         const text = args.text as string
-        // Clear typing indicator for this chat.
-        const ti = (globalThis as any).__typingIntervals?.get(chat_id)
-        if (ti) { clearInterval(ti); (globalThis as any).__typingIntervals.delete(chat_id) }
         const reply_to = args.reply_to != null ? Number(args.reply_to) : undefined
         const files = (args.files as string[] | undefined) ?? []
         const format = (args.format as string | undefined) ?? 'text'
@@ -907,16 +904,8 @@ async function handleInbound(
     return
   }
 
-  // Typing indicator — repeat every 4s until reply is sent (max 60s safety net).
-  if (!(globalThis as any).__typingIntervals) (globalThis as any).__typingIntervals = new Map()
-  const prevTi = (globalThis as any).__typingIntervals.get(chat_id)
-  if (prevTi) clearInterval(prevTi)
+  // Typing indicator — signals "processing" until we reply (or ~5s elapses).
   void bot.api.sendChatAction(chat_id, 'typing').catch(() => {})
-  const typingInterval = setInterval(() => {
-    void bot.api.sendChatAction(chat_id, 'typing').catch(() => {})
-  }, 4000)
-  setTimeout(() => { clearInterval(typingInterval); (globalThis as any).__typingIntervals.delete(chat_id) }, 60_000)
-  ;(globalThis as any).__typingIntervals.set(chat_id, typingInterval)
 
   // Ack reaction — lets the user know we're processing. Fire-and-forget.
   // Telegram only accepts a fixed emoji whitelist — if the user configures
