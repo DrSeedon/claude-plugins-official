@@ -9,6 +9,13 @@
  * Telegram's Bot API has no history or search. Reply-only tools.
  */
 
+import { appendFileSync } from 'fs'
+
+const TG_LOG = '/tmp/tg-plugin.log'
+function tgLog(tag: string, msg: string) {
+  try { appendFileSync(TG_LOG, `${new Date().toISOString()} [${tag}] ${msg}\n`) } catch {}
+}
+
 import { Server } from '@modelcontextprotocol/sdk/server/index.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import {
@@ -623,6 +630,7 @@ function shutdown(): void {
   if (shuttingDown) return
   shuttingDown = true
   process.stderr.write('telegram channel: shutting down\n')
+  tgLog('SHUTDOWN', 'shutting down')
   // bot.stop() signals the poll loop to end; the current getUpdates request
   // may take up to its long-poll timeout to return. Force-exit after 2s.
   setTimeout(() => process.exit(0), 2000)
@@ -660,7 +668,9 @@ bot.command('help', async ctx => {
     `Messages you send here route to a paired Claude Code session. ` +
     `Text and photos are forwarded; replies and reactions come back.\n\n` +
     `/start — pairing instructions\n` +
-    `/status — check your pairing state`
+    `/status — check your pairing state\n` +
+    `/ping — check if bot is alive\n` +
+    `/restart — restart Claude Code + TG plugin`
   )
 })
 
@@ -687,6 +697,24 @@ bot.command('status', async ctx => {
   }
 
   await ctx.reply(`Not paired. Send me a message to get a pairing code.`)
+})
+
+bot.command('restart', async ctx => {
+  if (ctx.chat?.type !== 'private') return
+  const access = loadAccess()
+  const senderId = String(ctx.from?.id ?? '')
+  if (!access.allowFrom.includes(senderId)) return
+  tgLog('RESTART', `requested by ${ctx.from?.username ?? senderId}`)
+  await ctx.reply('Перезапускаюсь... 🔄')
+  setTimeout(() => process.exit(0), 500)
+})
+
+bot.command('ping', async ctx => {
+  if (ctx.chat?.type !== 'private') return
+  const uptime = process.uptime()
+  const h = Math.floor(uptime / 3600)
+  const m = Math.floor((uptime % 3600) / 60)
+  await ctx.reply(`🏓 Pong! Uptime: ${h}h ${m}m`)
 })
 
 // Inline-button handler for permission requests. Callback data is
@@ -924,8 +952,22 @@ async function flushBatch(chatId: string): Promise<void> {
   const meta = buildMeta(batch.messages[0])
   const attachments: { kind: string; file_id: string; size?: number; mime?: string; name?: string }[] = []
 
+  // Collect forwarded_from from all messages in batch
+  const fwdNames = new Set<string>()
+  for (const m of batch.messages) {
+    if (m.forwardedFrom) fwdNames.add(m.forwardedFrom)
+  }
+  if (fwdNames.size > 0) {
+    meta.forwarded_from = [...fwdNames].join(', ')
+  }
+
   for (const msg of batch.messages) {
     meta.ts = msg.ts  // always keep latest timestamp
+
+    // Inline forwarded_from tag before each forwarded message's content
+    if (msg.forwardedFrom) {
+      parts.push(`[forwarded from: ${msg.forwardedFrom}]`)
+    }
 
     if (msg.media) {
       const kind = msg.media.kind
@@ -1062,15 +1104,29 @@ function handleInbound(
       replyToText: ctx.message.reply_to_message.text ?? '',
       replyToMsgId: String(ctx.message.reply_to_message.message_id),
     } : {}),
-    ...(ctx.message?.forward_origin ? {
-      forwardedFrom: ctx.message.forward_origin.type === 'user'
-        ? (ctx.message.forward_origin as any).sender_user?.first_name ?? 'user'
-        : ctx.message.forward_origin.type === 'hidden_user'
-        ? (ctx.message.forward_origin as any).sender_user_name ?? 'hidden'
-        : ctx.message.forward_origin.type === 'channel'
-        ? (ctx.message.forward_origin as any).chat?.title ?? 'channel'
-        : ctx.message.forward_origin.type,
-    } : {}),
+    ...((() => {
+      const fo = ctx.message?.forward_origin
+      const fd = (ctx.message as any)?.forward_date
+      const ff = (ctx.message as any)?.forward_from
+      const ffc = (ctx.message as any)?.forward_from_chat
+      const ffn = (ctx.message as any)?.forward_sender_name
+      tgLog('FWD', `origin=${JSON.stringify(fo)} from=${JSON.stringify(ff)} chat=${JSON.stringify(ffc)} sender_name=${ffn}`)
+      if (fo) {
+        return {
+          forwardedFrom: fo.type === 'user'
+            ? (fo as any).sender_user?.first_name ?? 'user'
+            : fo.type === 'hidden_user'
+            ? (fo as any).sender_user_name ?? 'hidden'
+            : fo.type === 'channel'
+            ? (fo as any).chat?.title ?? 'channel'
+            : fo.type,
+        }
+      }
+      if (ff) return { forwardedFrom: ff.first_name ?? 'user' }
+      if (ffn) return { forwardedFrom: ffn }
+      if (ffc) return { forwardedFrom: ffc.title ?? 'channel' }
+      return {}
+    })()),
   }
 
   if (debounceMs > 0) {
@@ -1099,6 +1155,7 @@ function handleInbound(
 // (grammy's default error handler calls bot.stop() and rethrows).
 bot.catch(err => {
   process.stderr.write(`telegram channel: handler error (polling continues): ${err.error}\n`)
+  tgLog('ERROR', `handler error: ${err.error}`)
 })
 
 // 409 Conflict = another getUpdates consumer is still active (zombie from a
@@ -1111,11 +1168,18 @@ void (async () => {
         onStart: info => {
           botUsername = info.username
           process.stderr.write(`telegram channel: polling as @${info.username}\n`)
+          tgLog('START', `polling as @${info.username}`)
+          const access = loadAccess()
+          for (const uid of access.allowFrom) {
+            void bot.api.sendMessage(uid, '🦜 Кеша перезапустился и готов к работе!').catch(() => {})
+          }
           void bot.api.setMyCommands(
             [
               { command: 'start', description: 'Welcome and setup guide' },
               { command: 'help', description: 'What this bot can do' },
               { command: 'status', description: 'Check your pairing status' },
+              { command: 'restart', description: 'Restart Claude Code + TG' },
+              { command: 'ping', description: 'Check if bot is alive' },
             ],
             { scope: { type: 'all_private_chats' } },
           ).catch(() => {})
@@ -1131,6 +1195,7 @@ void (async () => {
         process.stderr.write(
           `telegram channel: 409 Conflict${detail}, retrying in ${delay / 1000}s\n`,
         )
+        tgLog('409', `Conflict attempt=${attempt}, retrying in ${delay / 1000}s`)
         await new Promise(r => setTimeout(r, delay))
         continue
       }
