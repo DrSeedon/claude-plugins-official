@@ -1169,9 +1169,20 @@ void (async () => {
           botUsername = info.username
           process.stderr.write(`telegram channel: polling as @${info.username}\n`)
           tgLog('START', `polling as @${info.username}`)
-          const access = loadAccess()
-          for (const uid of access.allowFrom) {
-            void bot.api.sendMessage(uid, '🦜 Кеша перезапустился и готов к работе!').catch(() => {})
+          // Send startup notification only if not sent recently (debounce 60s via file flag)
+          const fs = require('fs')
+          const flagFile = '/tmp/kesha-started-flag'
+          let shouldNotify = true
+          try {
+            const stat = fs.statSync(flagFile)
+            if (Date.now() - stat.mtimeMs < 60000) shouldNotify = false
+          } catch {}
+          if (shouldNotify) {
+            fs.writeFileSync(flagFile, String(Date.now()))
+            const access = loadAccess()
+            for (const uid of access.allowFrom) {
+              void bot.api.sendMessage(uid, '🦜 Кеша перезапустился и готов к работе!').catch(() => {})
+            }
           }
           void bot.api.setMyCommands(
             [
